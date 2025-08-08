@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+requests
+pymupdf
+sentence-transformers
+faiss-cpu
+numpy
+google-generativeai
+nltk
