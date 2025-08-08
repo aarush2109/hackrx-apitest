@@ -11,7 +11,7 @@ import numpy as np
 import google.generativeai as genai
 
 # --- Config ---
-genai.configure(api_key="")
+genai.configure(api_key=os.environ.get("GOOGLE_API_KEY", ""))
 
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
