@@ -1,123 +1,77 @@
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
-from fastapi.responses import JSONResponse
-import requests
-import fitz  # PyMuPDF
 import os
-import uuid
-from sentence_transformers import SentenceTransformer
+import fitz
 import faiss
 import numpy as np
+import nltk
+from nltk.tokenize import sent_tokenize
+from sentence_transformers import SentenceTransformer
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+import uvicorn
 import google.generativeai as genai
 
-# --- Config ---
-genai.configure(api_key=os.environ.get("GOOGLE_API_KEY", ""))
+nltk.download("punkt")
+nltk.download("punkt_tab")
 
-model = SentenceTransformer('all-MiniLM-L6-v2')
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY environment variable is not set!")
+
+genai.configure(api_key=GEMINI_API_KEY)
+
+model = SentenceTransformer("all-MiniLM-L6-v2", cache_folder="./models")
+index = None
+sentences = None
 
 app = FastAPI()
 
-# --- Input/Output Models ---
-class QueryRequest(BaseModel):
-    pdf_url: str
-    questions: list[str]
-
-class QueryResponse(BaseModel):
-    answers: dict
-
-# --- Helper Functions ---
-def download_pdf_from_url(pdf_url):
-    try:
-        response = requests.get(pdf_url)
-        response.raise_for_status()
-        file_path = f"/tmp/{uuid.uuid4().hex}.pdf"
-        with open(file_path, "wb") as f:
-            f.write(response.content)
-        return file_path
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download PDF: {e}")
-
 def extract_text_from_pdf(file_path):
     try:
-        doc = fitz.open(file_path)
-        text = " ".join([page.get_text() for page in doc])
-        doc.close()
-        return text
+        text_parts = []
+        with fitz.open(file_path) as doc:
+            for page in doc:
+                text_parts.append(page.get_text())
+        return " ".join(text_parts)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF extraction error: {e}")
 
-def chunk_text(text, chunk_size=300, overlap=50):
-    import nltk
-    nltk.download("punkt")
-    from nltk.tokenize import sent_tokenize
-
+def create_faiss_index(text):
+    global index, sentences
     sentences = sent_tokenize(text)
-    chunks = []
-    chunk = ""
-    for sentence in sentences:
-        if len(chunk) + len(sentence) <= chunk_size:
-            chunk += " " + sentence
-        else:
-            chunks.append(chunk.strip())
-            chunk = sentence
-    if chunk:
-        chunks.append(chunk.strip())
-
-    # Add overlap
-    final_chunks = []
-    for i in range(0, len(chunks), 1):
-        start = max(0, i - 1)
-        final_chunks.append(" ".join(chunks[start:i + 1]))
-    return final_chunks
-
-def create_faiss_index(chunks):
-    embeddings = model.encode(chunks)
+    embeddings = model.encode(sentences)
     dim = embeddings.shape[1]
     index = faiss.IndexFlatL2(dim)
-    index.add(np.array(embeddings))
-    return index, embeddings, chunks
+    index.add(np.array(embeddings).astype("float32"))
 
-def get_top_k_chunks(question, index, chunks, embeddings, k=5):
-    q_embedding = model.encode([question])
-    D, I = index.search(np.array(q_embedding), k)
-    return [chunks[i] for i in I[0]]
+def search(query, k=3):
+    query_embedding = model.encode([query])
+    distances, indices = index.search(np.array(query_embedding).astype("float32"), k)
+    return [sentences[i] for i in indices[0]]
 
 def generate_answer(context, question):
-    prompt = f"""
-Answer the following question using the provided context only.
-If the answer is not in the context, say "Not Found".
+    prompt = f"Context:\n{context}\n\nQuestion:\n{question}\nAnswer:"
+    response = genai.GenerativeModel("gemini-pro").generate_content(prompt)
+    return (response.text or "").strip()
 
-Context:
-{context}
+@app.post("/upload/")
+async def upload_file(file: UploadFile = File(...)):
+    file_path = f"/tmp/{file.filename}"
+    try:
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+        text = extract_text_from_pdf(file_path)
+        create_faiss_index(text)
+        return {"message": "File processed successfully"}
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
-Question:
-{question}
-"""
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    response = model.generate_content(prompt)
-    return response.text.strip()
+@app.post("/query/")
+async def query_file(query: str = Form(...)):
+    if index is None:
+        raise HTTPException(status_code=400, detail="No file uploaded yet")
+    context = " ".join(search(query))
+    answer = generate_answer(context, query)
+    return {"answer": answer}
 
-# --- API Route ---
-@app.post("/query", response_model=QueryResponse)
-async def query_pdf(request: QueryRequest):
-    # Step 1: Download
-    file_path = download_pdf_from_url(request.pdf_url)
-
-    # Step 2: Extract
-    full_text = extract_text_from_pdf(file_path)
-
-    # Step 3: Chunk & Index
-    chunks = chunk_text(full_text)
-    index, embeddings, chunk_texts = create_faiss_index(chunks)
-
-    # Step 4: Answer questions
-    result = {}
-    for question in request.questions:
-        top_chunks = get_top_k_chunks(question, index, chunk_texts, embeddings)
-        context = "\n".join(top_chunks)
-        answer = generate_answer(context, question)
-        result[question] = answer
-
-    os.remove(file_path)  # Clean up
-
-    return {"answers": result}
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
